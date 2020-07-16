@@ -4,17 +4,13 @@
 
 using System;
 using System.Collections.Concurrent;
-using System.Linq;
-using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Threading;
 using Elastic.CommonSchema;
 using Elasticsearch.Net;
-using Microsoft.Extensions.Logging;
 
 namespace Elasticsearch.Extensions.Logging
 {
-	internal class ElasticsearchDataProcessor : IDisposable
+	internal class ElasticsearchDataShipper : IDisposable
 	{
 		private const int MaxQueuedMessages = 1024;
 
@@ -23,22 +19,15 @@ namespace Elasticsearch.Extensions.Logging
 
 		private readonly Thread _outputThread;
 
-		public ElasticsearchDataProcessor()
+		public ElasticsearchDataShipper()
 		{
-			_outputThread = new Thread(ProcessLogQueue) { IsBackground = true, Name = "ElasticsearchLoggerProcessor.ProcessLogQueue" };
+			_outputThread = new Thread(ProcessLogQueue) { IsBackground = true, Name = $"{nameof(ElasticsearchLogger)}.{nameof(ProcessLogQueue)}" };
 			_outputThread.Start();
 		}
 
-		private Agent? _agent;
-
-		private Ecs? _ecs;
-		private Host? _host;
 		private IElasticLowLevelClient _lowLevelClient = default!;
 
 		private ElasticsearchLoggerOptions _options = default!;
-		private int _processId;
-		private string? _processName;
-		private Service? _service;
 
 		internal ElasticsearchLoggerOptions Options
 		{
@@ -82,111 +71,6 @@ namespace Elasticsearch.Extensions.Logging
 			catch (Exception) { }
 		}
 
-		public Ecs GetEcs()
-		{
-			if (_ecs is null) _ecs = new Ecs() { Version = Base.Version };
-
-			return _ecs;
-		}
-
-		internal Agent GetAgent()
-		{
-			if (_agent is null)
-			{
-				var assembly = typeof(ElasticsearchLogger).Assembly;
-				var type = assembly.GetName().Name;
-				var versionAttribute = assembly.GetCustomAttributes(false)
-					.OfType<AssemblyInformationalVersionAttribute>()
-					.FirstOrDefault();
-				var version = versionAttribute?.InformationalVersion;
-				_agent = new Agent { Type = type, Version = version };
-			}
-
-			return _agent;
-		}
-
-		internal Host GetHost()
-		{
-			if (_host is null)
-			{
-				// Architecture osArchitecture = RuntimeInformation.OSArchitecture;
-				// if (osDescription.Contains('#'))
-				// {
-				//     int indexOfHash = osDescription.IndexOf('#');
-				//     osDescription = osDescription.Substring(0, Math.Max(0, indexOfHash - 1));
-				// }
-
-				var operatingSystem = new Os
-				{
-					Full = RuntimeInformation.OSDescription,
-					Platform = Environment.OSVersion.Platform.ToString(),
-					Version = Environment.OSVersion.Version.ToString()
-				};
-				_host = new Host
-				{
-					Hostname = Environment.MachineName, Architecture = RuntimeInformation.OSArchitecture.ToString(), Os = operatingSystem
-				};
-			}
-
-			return _host;
-		}
-
-		internal Process GetProcess()
-		{
-			if (_processName == null)
-			{
-				using var process = System.Diagnostics.Process.GetCurrentProcess();
-				_processId = process.Id;
-				_processName = process.ProcessName;
-			}
-
-			var currentThread = Thread.CurrentThread;
-
-			return new Process
-			{
-				Name = _processName,
-				Pid = _processId,
-				Thread = new ProcessThread { Name = currentThread.Name, Id = currentThread.ManagedThreadId }
-			};
-		}
-
-		internal Service GetService()
-		{
-			if (_service is null)
-			{
-				var entryAssembly = Assembly.GetEntryAssembly();
-				var entryAssemblyName = entryAssembly.GetName();
-				var type = entryAssemblyName.Name;
-				var versionAttribute = entryAssembly.GetCustomAttributes(false)
-					.OfType<AssemblyInformationalVersionAttribute>()
-					.FirstOrDefault();
-				var version = versionAttribute?.InformationalVersion ?? entryAssemblyName.Version.ToString();
-				_service = new Service { Type = type, Version = version };
-			}
-
-			return _service;
-		}
-
-		internal int GetSeverity(LogLevel logLevel)
-		{
-			switch (logLevel)
-			{
-				case LogLevel.Critical:
-					return 2;
-				case LogLevel.Error:
-					return 3;
-				case LogLevel.Warning:
-					return 4;
-				case LogLevel.Information:
-					return 6;
-				case LogLevel.Debug:
-				case LogLevel.Trace:
-					return 7;
-				default:
-					return 7;
-			}
-		}
-
 		private void PostEvent(LogEvent logEvent)
 		{
 			var indexTime = logEvent.Timestamp ?? ElasticsearchLoggerProvider.LocalDateTimeProvider();
@@ -194,10 +78,14 @@ namespace Elasticsearch.Extensions.Logging
 
 			var index = string.Format(_options.Index, indexTime);
 
-			var id = Guid.NewGuid().ToString();
-
 			var localClient = _lowLevelClient;
-			var response = localClient.Index<StringResponse>(index, id, PostData.Serializable(logEvent));
+			var response = localClient.Index<StringResponse>(index,
+				PostData.StreamHandler(logEvent,
+					(@event, stream) => logEvent.Serialize(stream),
+					// async variant not used yet but will when we move to channels/tpl in the future
+					async (@event, stream, ctx) => await logEvent.SerializeAsync(stream, ctx).ConfigureAwait(false)
+					)
+				);
 		}
 
 		private void ProcessLogQueue()
